@@ -12,63 +12,53 @@
 <section class="card"><h2>Physical Expressions</h2>
 <p>Input-referred sideband voltages:</p>
 <p>\[V_A=\sqrt{k_B T_A Z_0},\qquad V_G\approx |S_{21}|\sqrt{k_B T_G Z_0}.\]</p>
-<p>These enter similarly to external series sideband voltage sources.</p>
+<p>The active model includes amplifier noise through \(T_A\) (default \(1.3\,\mathrm{K}\)) and uses \(Z_0=50\,\Omega\) at the readout reference plane.</p>
 </section>
 <section class="card"><h2>Noise Vector Derivation</h2>
-<p>For a source that is uncorrelated between USB and LSB and uncorrelated with thermal power, use:</p>
-<p>\[n_{RO}=\begin{bmatrix}v_{USB}\\v_{LSB}^*\\0\end{bmatrix},\quad
-\langle|v_{USB}|^2\rangle=\langle|v_{LSB}|^2\rangle=V_A^2+V_G^2.
-\]</p>
-<p>Transform to normalized coordinates with Eq. (12):</p>
-<p>\[N_{RO}=T_V^{-1}d^{-1}n_{RO}.\]</p>
-<p>Equivalent explicit decomposition is:</p>
+<p>The code builds amplifier modes in sideband form first:</p>
 <p>\[
-N_{RO,A}=
-\begin{bmatrix}
-\sigma_{RO,A}\\
-0\\
-0
-\end{bmatrix},
+n_{\mathrm{amp},A}^{SB}=\frac{V_A}{\sqrt{2}}
+\begin{bmatrix}1\\1\\0\\0\end{bmatrix},
 \qquad
-N_{RO,\phi}=
-\begin{bmatrix}
-0\\
-i\sigma_{RO,\phi}\\
-0
-\end{bmatrix},
+n_{\mathrm{amp},\phi}^{SB}=\frac{V_A}{\sqrt{2}}
+\begin{bmatrix}-1\\1\\0\\0\end{bmatrix}.
 \]</p>
-<p>with \(\sigma_{RO,A}\) and \(\sigma_{RO,\phi}\) set from measured or modeled readout PSD levels after demodulation/normalization.</p>
-<p>If readout noise is measured directly in I/Q, it can be added as \\(\mathbf{S}_{amp}(\omega)\\) instead of via explicit \\(N\\) vectors.</p>
-<p>Implemented pipeline: readout-originated voltage noise starts in SB (USB/LSB) form, is transformed by the SB\(\rightarrow\)IQ normalization matrix, and then propagated with \(Y=M^{-1}N\) when represented as source vectors.</p>
-</section>
-<section class="card"><h2>Vector Component Units</h2>
-<p>Sideband-source vector units:</p>
+<p>Using the readout-circle radius</p>
 <p>\[
-\mathrm{units}(n_{RO})=
-\begin{bmatrix}
-\mathrm{V}/\sqrt{\mathrm{Hz}}\\
-\mathrm{V}/\sqrt{\mathrm{Hz}}\\
-0
-\end{bmatrix}.
+r_V=\frac{\sqrt{P_0Z_0}}{2},
 \]</p>
-<p>After normalization transform, component units follow the Johnson-style \(N\)-basis:</p>
+<p>the sidebands are mapped to normalized readout coordinates \([r,\phi]\). This reproduces the matched-resonator estimate</p>
 <p>\[
-\mathrm{units}(N_{RO,A})=
-\begin{bmatrix}
-1/\sqrt{\mathrm{Hz}}\\
-1/\sqrt{\mathrm{Hz}}\\
-0
-\end{bmatrix},
-\qquad
-\mathrm{units}(N_{RO,\phi})=
-\begin{bmatrix}
-1/\sqrt{\mathrm{Hz}}\\
-1/\sqrt{\mathrm{Hz}}\\
-0
-\end{bmatrix}.
+\sigma_{\mathrm{amp}}=\frac{\sqrt{2}V_A}{r_V}=\sqrt{\frac{8k_BT_A}{P_0}}.
 \]</p>
+<p>The implementation compares SB-derived vectors to the closed-form vectors \(N_{\mathrm{amp},A}=[\sigma_{\mathrm{amp}},0,0,0]^T\) and \(N_{\mathrm{amp},\phi}=[0,i\sigma_{\mathrm{amp}},0,0]^T\), and raises if they disagree.</p>
 </section>
 <section class="card"><h2>Integration Into Model</h2>
-<p>Include either as vector-propagated term \\(Y_{RO}=M^{-1}N_{RO}\\) or as additive readout PSD block in \\(\mathbf{S}_{IQ}(\omega)\\), but avoid double counting.</p>
+<p><strong>Correct treatment for this linear 2-KID model:</strong> amplifier noise is additive measured readout noise in \(r/\phi\). If heater feedback is enabled, the same measured phase noise also drives the feedback heater, so the direct measurement term and heater-return term are correlated and must be solved together as one complex transfer.</p>
+<p>This is different from adding an independent heater-noise PSD after the fact. The heater-return signal is not a new uncorrelated noise source; it is the controlled plant response to the same amplifier phase fluctuation already present in the measured output.</p>
+<p>For a measured readout-noise realization \(q=[q_r,q_\phi]^T\), the device response is solved with the heater-feedback source</p>
+<p>\[
+N_{\mathrm{fb,amp}}=
+\begin{bmatrix}
+0\\0\\0\\
+\left(K_p+i\omega K_d\right)q_\phi
+\end{bmatrix}.
+\]</p>
+<p>The measured output is then \(Y_{\mathrm{meas}}=M^{-1}N_{\mathrm{fb,amp}}+[q_r,q_\phi,0,0]^T\). This allows partial cancellation or enhancement depending on loop sign, gain, and frequency.</p>
+<p>Two independent amplifier modes are included, \(q_A=[\sigma_{\mathrm{amp}},0]^T\) and \(q_\phi=[0,i\sigma_{\mathrm{amp}}]^T\). Their solved phase PSD contributions are added in quadrature with Johnson, phonon, TLS, and electronic noise:</p>
+<p>\[
+S_{\phi,\mathrm{total}}=S_{\phi,J}+S_{\phi,\mathrm{TLS}}+S_{\phi,\mathrm{ph}}+S_{\phi,e}+S_{\phi,\mathrm{amp}}.
+\]</p>
+<p>Do not add a separate external amplifier PSD block unless this internal amplifier path is disabled.</p>
+</section>
+<section class="card"><h2>Physical Scope</h2>
+<p>This treatment is physically consistent for the present small-signal model under these assumptions:</p>
+<ul>
+  <li>The feedback controller senses phase only, so \(q_\phi\) drives the heater and \(q_r\) enters directly as amplitude readout noise.</li>
+  <li>The feedback heater command is linear, \(K_p+i\omega K_d\), with no saturation, quantization, DAC/ADC noise, or additional electronics delay.</li>
+  <li>The actuator thermal dynamics are the island-2 thermal dynamics already represented inside \(M(\omega)\).</li>
+  <li>The amplifier is represented by white input-referred noise temperature \(T_A\) at a matched \(50\,\Omega\) readout plane.</li>
+</ul>
+<p>A more complete readout/control model would add independent controller electronics noise, loop delay and filters, heater-current noise, actuator nonlinearity, and feedline loss or mismatch. Those effects should be added as separate correlated or uncorrelated paths only when their physical reference planes are specified.</p>
 </section>
 </main></body></html>

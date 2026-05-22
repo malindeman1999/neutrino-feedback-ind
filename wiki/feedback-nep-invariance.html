@@ -109,7 +109,8 @@
         <li>The event signal is power injected into island 1, \(N_3\).</li>
         <li>Feedback enters only through \(m_{42}\), which is in the Q column.</li>
         <li>Noise source vectors do not depend on \(K_p\) or \(K_d\).</li>
-        <li>No additional feedback electronics, heater-current, or readout noise is injected through the feedback path.</li>
+        <li>No additional feedback electronics or heater-current noise is injected through the feedback path.</li>
+        <li>Readout amplifier noise is excluded from this invariance argument unless it is held fixed as an external output-noise block. In the active implementation, measured phase noise drives the heater and therefore intentionally violates this assumption for the amplifier term.</li>
         <li>The same fixed frequency grid and estimator are used when comparing feedback gains.</li>
       </ul>
     </section>
@@ -121,6 +122,7 @@
         <li>A noise vector depends directly or indirectly on feedback gain.</li>
         <li>Noise sources are combined coherently before propagation instead of independently in power.</li>
         <li>TLS scaling or another model component is normalized to a feedback-dependent Johnson quantity.</li>
+        <li>Amplifier/readout noise is allowed to drive the heater feedback path; this creates a correlated direct-plus-return readout-noise transfer that can change with \(K_p\) and \(K_d\).</li>
         <li>The energy-resolution integration bandwidth changes with feedback-dependent eigenvalues.</li>
         <li>The calculation is not using the same source vector for signal responsivity and NEP normalization.</li>
       </ul>

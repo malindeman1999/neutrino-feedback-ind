@@ -84,6 +84,7 @@ class SensorInputs:
     # Readout condition
     detuning_widths: float
     nep_sufficiency_percent: float
+    amplifier_noise_temperature_K: float
     event_power_fraction_kid1: float
     # Optional second series KID / second island parameters
     heater2_offset_dBm: float = -1000.0
@@ -138,6 +139,7 @@ class Version1SensorInputs(SensorInputs):
     thermal_energy_resolution_target_eV: float = 0.1
     detuning_widths: float = 0.1
     nep_sufficiency_percent: float = 10.0
+    amplifier_noise_temperature_K: float = 1.3
     event_power_fraction_kid1: float = 0.5
     heater2_offset_dBm: float = -95.0
     heat_capacity2_eV_per_mK: float = 3.0
@@ -343,6 +345,12 @@ class Sensor:
         return self.event_power_fraction_kid1_clamped * self.ho_decay_energy_J / self.C_J_per_K
 
     @cached_property
+    def event_peak_temperature_K(self) -> float:
+        if not np.isfinite(self.deltaT_event_full_absorption_K):
+            return float("nan")
+        return self.T0_K + self.deltaT_event_full_absorption_K
+
+    @cached_property
     def event_power_fraction_kid1_clamped(self) -> float:
         return float(min(1.0, max(0.0, self.event_power_fraction_kid1)))
 
@@ -430,6 +438,11 @@ class Sensor:
         """Nominal resonator characteristic impedance at f0."""
         w0 = 2.0 * pi * self.f0_Hz
         return w0 * self.L_series_total_H
+
+    @cached_property
+    def Z0_readout_Ohm(self) -> float:
+        """Matched feedline/readout reference impedance."""
+        return 50.0
 
     @cached_property
     def R0_Ohm(self) -> float:
@@ -577,6 +590,31 @@ class Sensor:
         if not np.allclose(a, b, rtol=rtol, atol=atol):
             diff = np.max(np.abs(a - b))
             raise ValueError(f"{label}: legacy and SB-derived noise vectors disagree (max |delta|={diff:.3e})")
+
+    @cached_property
+    def readout_circle_radius_V(self) -> float:
+        """Matched-resonator output-circle radius used for amplifier noise."""
+        if self.P0_W <= 0.0:
+            return 0.0
+        return 0.5 * sqrt(self.P0_W * self.Z0_readout_Ohm)
+
+    @cached_property
+    def readout_sb_to_iq_normalization_matrix(self) -> np.ndarray:
+        """Readout-plane SB -> normalized [r, phi] map for amplifier noise."""
+        rv = self.readout_circle_radius_V
+        if rv <= 0.0:
+            return np.zeros((2, 2), dtype=complex)
+        return np.array(
+            (
+                (1.0 / rv, 1.0 / rv),
+                (-1.0j / rv, 1.0j / rv),
+            ),
+            dtype=complex,
+        )
+
+    def _readout_iq_from_sb(self, v_usb: complex, v_lsb: complex) -> tuple[complex, complex]:
+        iq = self.readout_sb_to_iq_normalization_matrix @ np.array((v_usb, v_lsb), dtype=complex)
+        return complex(iq[0]), complex(iq[1])
 
     def _n_johnson_A_1_legacy(self) -> tuple[complex, complex, complex, complex]:
         return (self.nj1_scale + 0.0j, 0.0 + 0.0j, -self.nj1_thermal_scale + 0.0j, 0.0 + 0.0j)
@@ -753,6 +791,7 @@ class Sensor:
         asd_phase_phonon = np.zeros_like(freqs_hz)
         asd_phase_tls = np.zeros_like(freqs_hz)
         asd_phase_electronic = np.zeros_like(freqs_hz)
+        asd_phase_amplifier = np.zeros_like(freqs_hz)
         phase_resp = np.zeros_like(freqs_hz)
 
         for i, f_hz in enumerate(freqs_hz):
@@ -767,14 +806,19 @@ class Sensor:
             y_e_phi1 = self._propagate_noise_vector(self.n_electronic_phi_1(), float(f_hz))
             y_e_a2 = self._propagate_noise_vector(self.n_electronic_A_2(), float(f_hz))
             y_e_phi2 = self._propagate_noise_vector(self.n_electronic_phi_2(), float(f_hz))
+            y_amp_a = self.y_amplifier_A_at_hz(float(f_hz))
+            y_amp_phi = self.y_amplifier_phi_at_hz(float(f_hz))
 
             asd_phase_johnson[i] = np.sqrt(abs(y_j_a1[1]) ** 2 + abs(y_j_phi1[1]) ** 2 + abs(y_j_a2[1]) ** 2 + abs(y_j_phi2[1]) ** 2)
             asd_phase_phonon[i] = np.sqrt(abs(y_ph1[1]) ** 2 + abs(y_ph2[1]) ** 2)
             asd_phase_tls[i] = abs(y_tls[1])
             asd_phase_electronic[i] = np.sqrt(abs(y_e_a1[1]) ** 2 + abs(y_e_phi1[1]) ** 2 + abs(y_e_a2[1]) ** 2 + abs(y_e_phi2[1]) ** 2)
+            asd_phase_amplifier[i] = np.sqrt(abs(y_amp_a[1]) ** 2 + abs(y_amp_phi[1]) ** 2)
             phase_resp[i] = self.phase_responsivity_mag_rad_per_W_at_hz(float(f_hz))
 
-        asd_phase_total = np.sqrt(asd_phase_johnson**2 + asd_phase_phonon**2 + asd_phase_tls**2 + asd_phase_electronic**2)
+        asd_phase_total = np.sqrt(
+            asd_phase_johnson**2 + asd_phase_phonon**2 + asd_phase_tls**2 + asd_phase_electronic**2 + asd_phase_amplifier**2
+        )
         nep_phase_total = np.where(phase_resp > 0.0, asd_phase_total / phase_resp, np.nan)
         return freqs_hz, nep_phase_total
 
@@ -927,6 +971,83 @@ class Sensor:
         m = self.m_matrix_array(f_hz)
         n = np.array(n_vec, dtype=complex)
         return np.linalg.solve(m, n)
+
+    @cached_property
+    def amplifier_sideband_voltage_asd_V_per_rtHz(self) -> float:
+        """Input-referred amplifier voltage ASD in each sideband."""
+        ta = max(float(self.amplifier_noise_temperature_K), 0.0)
+        return sqrt(K_B * ta * self.Z0_readout_Ohm)
+
+    @cached_property
+    def amplifier_normalized_asd_per_rtHz(self) -> float:
+        """Paper estimate for demodulated normalized amplifier noise."""
+        if self.P0_W <= 0.0:
+            return 0.0
+        ta = max(float(self.amplifier_noise_temperature_K), 0.0)
+        return sqrt(8.0 * K_B * ta / self.P0_W)
+
+    def _n_amplifier_A_legacy(self) -> tuple[complex, complex, complex, complex]:
+        q = self.amplifier_normalized_asd_per_rtHz
+        return (q + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j)
+
+    def _n_amplifier_phi_legacy(self) -> tuple[complex, complex, complex, complex]:
+        q = self.amplifier_normalized_asd_per_rtHz
+        return (0.0 + 0.0j, 1j * q, 0.0 + 0.0j, 0.0 + 0.0j)
+
+    def _n_amplifier_A_sb(self) -> tuple[complex, complex, complex, complex]:
+        a_sb = self.amplifier_sideband_voltage_asd_V_per_rtHz / sqrt(2.0)
+        n_r, n_phi = self._readout_iq_from_sb(a_sb + 0.0j, a_sb + 0.0j)
+        return (n_r, n_phi, 0.0 + 0.0j, 0.0 + 0.0j)
+
+    def _n_amplifier_phi_sb(self) -> tuple[complex, complex, complex, complex]:
+        a_sb = self.amplifier_sideband_voltage_asd_V_per_rtHz / sqrt(2.0)
+        n_r, n_phi = self._readout_iq_from_sb(-a_sb + 0.0j, a_sb + 0.0j)
+        return (n_r, n_phi, 0.0 + 0.0j, 0.0 + 0.0j)
+
+    def n_amplifier_A(self) -> tuple[complex, complex, complex, complex]:
+        legacy = self._n_amplifier_A_legacy()
+        sb = self._n_amplifier_A_sb()
+        self._assert_noise_vector_agreement("n_amplifier_A", legacy, sb)
+        return sb
+
+    def n_amplifier_phi(self) -> tuple[complex, complex, complex, complex]:
+        legacy = self._n_amplifier_phi_legacy()
+        sb = self._n_amplifier_phi_sb()
+        self._assert_noise_vector_agreement("n_amplifier_phi", legacy, sb)
+        return sb
+
+    def _solve_readout_noise_vector(self, q_r: complex, q_phi: complex, f_hz: float) -> np.ndarray:
+        """Measured output from additive readout noise with correlated heater feedback."""
+        m = self.m_matrix_array(f_hz)
+        rhs = np.zeros(4, dtype=complex)
+        omega = 2.0 * pi * f_hz
+        heater_transfer_W_per_rad = (
+            self.feedback_heater_gain_W_per_rad
+            + (1.0j * omega * self.feedback_heater_derivative_gain_W_s_per_rad)
+        )
+        rhs[3] = heater_transfer_W_per_rad * q_phi
+        y = np.linalg.solve(m, rhs)
+        y[0] += q_r
+        y[1] += q_phi
+        return y
+
+    def y_amplifier_A_at_hz(self, f_hz: float) -> np.ndarray:
+        """Amplifier amplitude-quadrature measured noise output [r, phi, T1, T2]."""
+        n = self.n_amplifier_A()
+        return self._solve_readout_noise_vector(n[0], n[1], f_hz)
+
+    def y_amplifier_phi_at_hz(self, f_hz: float) -> np.ndarray:
+        """Amplifier phase-quadrature measured noise output [r, phi, T1, T2]."""
+        n = self.n_amplifier_phi()
+        return self._solve_readout_noise_vector(n[0], n[1], f_hz)
+
+    @cached_property
+    def y_amplifier_A(self) -> np.ndarray:
+        return self.y_amplifier_A_at_hz(self.f_demod_Hz)
+
+    @cached_property
+    def y_amplifier_phi(self) -> np.ndarray:
+        return self.y_amplifier_phi_at_hz(self.f_demod_Hz)
 
     @cached_property
     def y_johnson_A(self) -> np.ndarray:
@@ -1086,13 +1207,24 @@ class Sensor:
         return sqrt(self.sphi_electronic_per_hz)
 
     @cached_property
+    def sphi_amplifier_per_hz(self) -> float:
+        """Measured phase PSD from amplifier noise."""
+        ys = (self.y_amplifier_A, self.y_amplifier_phi)
+        return float(sum(abs(y[1]) ** 2 for y in ys))
+
+    @cached_property
+    def asd_phi_amplifier_per_rtHz(self) -> float:
+        return sqrt(self.sphi_amplifier_per_hz)
+
+    @cached_property
     def sphi_total_per_hz(self) -> float:
-        """Total phase-noise PSD from Johnson, TLS, phonon, and electronic sources."""
+        """Total phase-noise PSD from Johnson, TLS, phonon, electronic, and amplifier sources."""
         return (
             self.sphi_johnson_full_per_hz
             + self.sphi_tls_per_hz
             + (self.asd_phi_phonon_full_per_rtHz**2)
             + self.sphi_electronic_per_hz
+            + self.sphi_amplifier_per_hz
         )
 
     @cached_property
@@ -1115,6 +1247,10 @@ class Sensor:
     @cached_property
     def nep_phi_electronic_W_per_rtHz(self) -> float:
         return self.nep_from_phase_asd_W_per_rtHz(self.asd_phi_electronic_per_rtHz)
+
+    @cached_property
+    def nep_phi_amplifier_W_per_rtHz(self) -> float:
+        return self.nep_from_phase_asd_W_per_rtHz(self.asd_phi_amplifier_per_rtHz)
 
     @cached_property
     def nep_phi_total_W_per_rtHz(self) -> float:
@@ -1145,11 +1281,14 @@ class Sensor:
         y_e_p1 = self._propagate_noise_vector(self.n_electronic_phi_1(), 0.0)
         y_e_a2 = self._propagate_noise_vector(self.n_electronic_A_2(), 0.0)
         y_e_p2 = self._propagate_noise_vector(self.n_electronic_phi_2(), 0.0)
+        y_amp_a = self.y_amplifier_A_at_hz(0.0)
+        y_amp_p = self.y_amplifier_phi_at_hz(0.0)
         asd_j = sqrt(abs(y_j_a1[1]) ** 2 + abs(y_j_p1[1]) ** 2 + abs(y_j_a2[1]) ** 2 + abs(y_j_p2[1]) ** 2)
         asd_ph = sqrt(abs(y_ph1[1]) ** 2 + abs(y_ph2[1]) ** 2)
         asd_tls = abs(y_tls[1])
         asd_e = sqrt(abs(y_e_a1[1]) ** 2 + abs(y_e_p1[1]) ** 2 + abs(y_e_a2[1]) ** 2 + abs(y_e_p2[1]) ** 2)
-        asd_total = sqrt(asd_j**2 + asd_ph**2 + asd_tls**2 + asd_e**2)
+        asd_amp = sqrt(abs(y_amp_a[1]) ** 2 + abs(y_amp_p[1]) ** 2)
+        asd_total = sqrt(asd_j**2 + asd_ph**2 + asd_tls**2 + asd_e**2 + asd_amp**2)
         resp0 = self.phase_responsivity_mag_rad_per_W_at_hz(0.0)
         if resp0 == 0.0:
             return float("nan")
@@ -1790,6 +1929,13 @@ class Sensor:
         return bool(lhs >= rhs)
 
     @cached_property
+    def core_rule11_ok(self) -> bool:
+        """Rule 11: event peak temperature must stay below the superconductor Tc."""
+        if not np.isfinite(self.event_peak_temperature_K) or not np.isfinite(self.Tc_K):
+            return False
+        return bool(self.event_peak_temperature_K < self.Tc_K)
+
+    @cached_property
     def core_rule12_ok(self) -> bool:
         """Rule 12: Mt eigenvalues must all have negative real part."""
         return bool(self.mt_stable)
@@ -1862,6 +2008,7 @@ class Sensor:
             "deltaT_abs_over_bath_K": self.deltaT_abs_over_bath_K,
             "tbath_from_link_K": self.tbath_from_link_K,
             "deltaT_event_full_absorption_K": self.deltaT_event_full_absorption_K,
+            "event_peak_temperature_K": self.event_peak_temperature_K,
             "deltaT2_event_full_absorption_K": self.deltaT2_event_full_absorption_K,
             "kid2_thermal_headroom_K": self.kid2_thermal_headroom_K,
             "kid2_thermal_headroom_over_event_ratio": self.kid2_thermal_headroom_over_event_ratio,
@@ -1900,6 +2047,7 @@ class Sensor:
             "core_rule8_ok": float(self.core_rule8_ok),
             "core_rule9_ok": float(self.core_rule9_ok),
             "core_rule10_ok": float(self.core_rule10_ok),
+            "core_rule11_ok": float(self.core_rule11_ok),
             "core_rule12_ok": float(self.core_rule12_ok),
             "core_rule13_ok": float(self.core_rule13_ok),
             "core_rule14_ok": float(self.core_rule14_ok),
@@ -1908,6 +2056,8 @@ class Sensor:
             "L_total_H": self.L_total_H,
             "C_res_F": self.C_res_F,
             "Z0_res_Ohm": self.Z0_res_Ohm,
+            "Z0_readout_Ohm": self.Z0_readout_Ohm,
+            "readout_circle_radius_V": self.readout_circle_radius_V,
             "R0_Ohm": self.R0_Ohm,
             "Qc": self.Qc,
             "Qr": self.Qr,
@@ -1924,6 +2074,8 @@ class Sensor:
             "asd_phi_johnson_full_per_rtHz": self.asd_phi_johnson_full_per_rtHz,
             "sphi_tls_per_hz": self.sphi_tls_per_hz,
             "asd_phi_tls_per_rtHz": self.asd_phi_tls_per_rtHz,
+            "sphi_amplifier_per_hz": self.sphi_amplifier_per_hz,
+            "asd_phi_amplifier_per_rtHz": self.asd_phi_amplifier_per_rtHz,
             "sphi_electronic_per_hz": self.sphi_electronic_per_hz,
             "asd_phi_electronic_per_rtHz": self.asd_phi_electronic_per_rtHz,
             "sphi_total_per_hz": self.sphi_total_per_hz,
@@ -1935,6 +2087,7 @@ class Sensor:
             "nep_phi_tls_W_per_rtHz": self.nep_phi_tls_W_per_rtHz,
             "nep_phi_phonon_W_per_rtHz": self.nep_phi_phonon_W_per_rtHz,
             "nep_phi_electronic_W_per_rtHz": self.nep_phi_electronic_W_per_rtHz,
+            "nep_phi_amplifier_W_per_rtHz": self.nep_phi_amplifier_W_per_rtHz,
             "nep_phi_total_W_per_rtHz": self.nep_phi_total_W_per_rtHz,
             "nep_phi_phonon_0hz_W_per_rtHz": self.nep_phi_phonon_0hz_W_per_rtHz,
             "nep_phi_total_0hz_W_per_rtHz": self.nep_phi_total_0hz_W_per_rtHz,
@@ -1976,6 +2129,9 @@ class Sensor:
             "phonon_power_rms_W": self.phonon_power_rms_W,
             "johnson_voltage_rms_V": self.johnson_voltage_rms_V,
             "johnson_sv_V2_per_Hz": self.johnson_sv_V2_per_Hz,
+            "amplifier_noise_temperature_K": self.amplifier_noise_temperature_K,
+            "amplifier_sideband_voltage_asd_V_per_rtHz": self.amplifier_sideband_voltage_asd_V_per_rtHz,
+            "amplifier_normalized_asd_per_rtHz": self.amplifier_normalized_asd_per_rtHz,
             "M_e": self.me_electronic,
             "N_J_scale": self.nj_scale,
             "N_J_thermal_scale": self.nj_thermal_scale,
