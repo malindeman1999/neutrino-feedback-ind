@@ -20,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from sensor import Sensor, Version1SensorInputs
+from pileup_sweep import generate_pulse_sweep_dataset, recommended_time_grid
 
 
 PLOT_DIR = Path(__file__).resolve().parent
@@ -77,7 +78,8 @@ INPUT_SECTIONS = [
             "series_L2_ratio",
             "series_R2_ratio",
             "feedback_heater_gain_W_per_rad",
-            "feedback_heater_derivative_gain_W_s_per_rad",
+            "feedback_heater_derivative_time_s",
+            "feedback_heater_derivative_filter_factor",
         ],
     ),
 ]
@@ -91,7 +93,8 @@ KID2_KEYS = (
     "series_L2_ratio",
     "series_R2_ratio",
     "feedback_heater_gain_W_per_rad",
-    "feedback_heater_derivative_gain_W_s_per_rad",
+    "feedback_heater_derivative_time_s",
+    "feedback_heater_derivative_filter_factor",
 )
 KID2_ACTIVITY_KEYS = (
     "heat_capacity2_ratio",
@@ -101,7 +104,7 @@ KID2_ACTIVITY_KEYS = (
     "series_L2_ratio",
     "series_R2_ratio",
     "feedback_heater_gain_W_per_rad",
-    "feedback_heater_derivative_gain_W_s_per_rad",
+    "feedback_heater_derivative_time_s",
 )
 
 
@@ -135,7 +138,8 @@ LABELS = {
     "series_L2_ratio": "L2/L1",
     "series_R2_ratio": "R2/R1",
     "feedback_heater_gain_W_per_rad": "Kp [W/rad]",
-    "feedback_heater_derivative_gain_W_s_per_rad": "Kd [W*s/rad]",
+    "feedback_heater_derivative_time_s": "tau_d [s]",
+    "feedback_heater_derivative_filter_factor": "deriv filter N",
 }
 
 RULE_SPECS: list[tuple[str, str]] = [
@@ -263,6 +267,7 @@ class NoiseGui:
         self.entry_vars: dict[str, tk.StringVar] = {}
         self.entry_widgets: dict[str, ttk.Entry] = {}
         self.event_windows: list["EventResponseWindow"] = []
+        self.pulse_sweep_windows: list["PulseSweepWindow"] = []
 
         self._build_layout()
         self._apply_ui_state(self.startup_ui_state)
@@ -341,6 +346,9 @@ class NoiseGui:
         ttk.Radiobutton(
             readout_frame, text="Amplitude", variable=self.readout_var, value="Amplitude", command=self._on_mode
         ).grid(row=0, column=1, sticky="w", padx=(12, 0))
+        ttk.Radiobutton(
+            readout_frame, text="L2", variable=self.readout_var, value="L2", command=self._on_mode
+        ).grid(row=0, column=2, sticky="w", padx=(12, 0))
 
         kid_mode_frame = ttk.LabelFrame(controls, text="Configuration", padding=4)
         kid_mode_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 4))
@@ -414,6 +422,9 @@ class NoiseGui:
         ttk.Button(button_frame, text="Auto Critical Kd", command=self._set_critical_kd).grid(
             row=3, column=0, columnspan=3, padx=2, pady=2, sticky="ew"
         )
+        ttk.Button(button_frame, text="Pulse Sweeps", command=self._open_pulse_sweeps).grid(
+            row=4, column=0, columnspan=3, padx=2, pady=2, sticky="ew"
+        )
 
         for i in range(3):
             button_frame.columnconfigure(i, weight=1)
@@ -449,6 +460,10 @@ class NoiseGui:
         return dict(self.defaults)
 
     def _backfill_ratio_fields_from_absolute(self, merged: dict[str, float], loaded: dict) -> None:
+        if "feedback_heater_derivative_time_s" not in loaded and "feedback_heater_derivative_gain_W_s_per_rad" in loaded:
+            gain = float(loaded.get("feedback_heater_gain_W_per_rad", merged.get("feedback_heater_gain_W_per_rad", 0.0)))
+            if gain != 0.0:
+                merged["feedback_heater_derivative_time_s"] = float(loaded["feedback_heater_derivative_gain_W_s_per_rad"]) / gain
         if (
             "heat_capacity2_ratio" in loaded
             and "G2_ratio" in loaded
@@ -494,6 +509,14 @@ class NoiseGui:
         except Exception:
             return None
 
+    def _merge_loaded_settings(self, loaded_settings: dict) -> dict[str, float]:
+        vals = dict(self.defaults)
+        for k in INPUT_KEYS:
+            if k in loaded_settings:
+                vals[k] = float(loaded_settings[k])
+        self._backfill_ratio_fields_from_absolute(vals, loaded_settings)
+        return vals
+
     @staticmethod
     def _extract_settings_dict(loaded: object) -> dict | None:
         if not isinstance(loaded, dict):
@@ -529,7 +552,7 @@ class NoiseGui:
         if mode in ("Noise ASD", "NEP"):
             self.mode_var.set(mode)
         readout = ui.get("readout")
-        if readout in ("Phase", "Amplitude"):
+        if readout in ("Phase", "Amplitude", "L2"):
             self.readout_var.set(readout)
         kid2_mode = ui.get("kid2_mode")
         if kid2_mode in ("Single KID", "Dual KID"):
@@ -550,18 +573,44 @@ class NoiseGui:
         self._update_loaded_name()
 
     def _load_startup_settings(self) -> tuple[dict[str, float], dict[str, float], str | None, dict[str, str], dict[str, str]]:
-        # Startup should always reflect current code defaults.
-        # Saved presets remain available via explicit Load/Restore actions.
         vals = dict(self.defaults)
-        return vals, dict(vals), None, {}, {}
-
-    def _persist_startup_state(self, source_path: Path) -> None:
+        if not STARTUP_STATE_FILE.exists():
+            return vals, dict(vals), None, {}, {}
         try:
+            with STARTUP_STATE_FILE.open("rb") as f:
+                loaded = pickle.load(f)
+            loaded_settings = self._extract_settings_dict(loaded)
+            if isinstance(loaded_settings, dict) and any(k in loaded_settings for k in INPUT_KEYS):
+                vals = self._merge_loaded_settings(loaded_settings)
+            elif isinstance(loaded, dict):
+                source_path = loaded.get("source_path")
+                if isinstance(source_path, str):
+                    source_vals = self._load_settings_file(Path(source_path))
+                    if source_vals is not None:
+                        vals = source_vals
+            source_name = None
+            if isinstance(loaded, dict) and isinstance(loaded.get("source_path"), str):
+                source_name = Path(loaded["source_path"]).name
+            ui = self._extract_ui_state(loaded)
+            return vals, dict(vals), source_name, ui, ui
+        except Exception:
+            return vals, dict(vals), None, {}, {}
+
+    def _persist_startup_state(
+        self,
+        source_path: Path,
+        settings: dict[str, float] | None = None,
+        ui: dict[str, str] | None = None,
+    ) -> None:
+        try:
+            settings_to_save = self.current if settings is None else settings
+            ui_to_save = self._current_ui_state() if ui is None else ui
             with STARTUP_STATE_FILE.open("wb") as f:
                 pickle.dump(
                     {
                         "source_path": str(source_path),
-                        "ui": self._current_ui_state(),
+                        "settings": {k: float(settings_to_save[k]) for k in INPUT_KEYS},
+                        "ui": ui_to_save,
                     },
                     f,
                 )
@@ -648,11 +697,15 @@ class NoiseGui:
             if not np.isfinite(kd_crit):
                 self._set_status("Auto Critical Kd unavailable for current settings (requires stable positive M and K)")
                 return
-            self.current["feedback_heater_derivative_gain_W_s_per_rad"] = float(kd_crit)
+            kp = float(self.current.get("feedback_heater_gain_W_per_rad", 0.0))
+            if kp == 0.0:
+                self._set_status("Auto Critical Kd requires nonzero heater feedback gain")
+                return
+            self.current["feedback_heater_derivative_time_s"] = float(kd_crit / kp)
             self._write_fields(self.current)
             self._recompute_and_draw()
             self._push_undo(prev)
-            self._set_status(f"Set Kd to critical damping estimate: {kd_crit:.6g} W*s/rad")
+            self._set_status(f"Set derivative time from critical Kd: {kd_crit / kp:.6g} s")
         except Exception as exc:
             self.current = prev
             self._write_fields(self.current)
@@ -720,7 +773,7 @@ class NoiseGui:
             kwargs["pg_drive_dBm"] = -1000.0
         if not self.heater_feedback_on_var.get():
             kwargs["feedback_heater_gain_W_per_rad"] = 0.0
-            kwargs["feedback_heater_derivative_gain_W_s_per_rad"] = 0.0
+            kwargs["feedback_heater_derivative_time_s"] = 0.0
         if not self.heater_offset_on_var.get():
             kwargs["heater2_offset_dBm"] = -1000.0
         if self.kid2_mode_var.get() == "Single KID":
@@ -732,7 +785,7 @@ class NoiseGui:
             kwargs["series_L2_H"] = 0.0
             kwargs["series_R2_Ohm"] = 0.0
             kwargs["feedback_heater_gain_W_per_rad"] = 0.0
-            kwargs["feedback_heater_derivative_gain_W_s_per_rad"] = 0.0
+            kwargs["feedback_heater_derivative_time_s"] = 0.0
         return Sensor(Version1SensorInputs(**kwargs))
 
     def _set_kid2_fields_enabled(self) -> None:
@@ -757,7 +810,7 @@ class NoiseGui:
         base["series_R2_ratio"] = 1.0
         base["event_power_fraction_kid1"] = 0.5
         base["feedback_heater_gain_W_per_rad"] = 0.0
-        base["feedback_heater_derivative_gain_W_s_per_rad"] = 0.0
+        base["feedback_heater_derivative_time_s"] = 0.0
         self.current = base
         self._write_fields(self.current)
 
@@ -817,7 +870,7 @@ class NoiseGui:
                 self.current["series_R2_ratio"] = 1.0
                 self.current["event_power_fraction_kid1"] = 0.5
                 self.current["feedback_heater_gain_W_per_rad"] = 0.0
-                self.current["feedback_heater_derivative_gain_W_s_per_rad"] = 0.0
+                self.current["feedback_heater_derivative_time_s"] = 0.0
                 self._write_fields(self.current)
             except Exception:
                 pass
@@ -850,7 +903,7 @@ class NoiseGui:
             self.current["series_R2_ratio"] = 1.0
             self.current["event_power_fraction_kid1"] = 0.5
             self.current["feedback_heater_gain_W_per_rad"] = 0.0
-            self.current["feedback_heater_derivative_gain_W_s_per_rad"] = 0.0
+            self.current["feedback_heater_derivative_time_s"] = 0.0
             self.kid2_mode_var.set("Dual KID")
             self._write_fields(self.current)
             self._set_kid2_fields_enabled()
@@ -882,8 +935,18 @@ class NoiseGui:
         asd_amp_electronic = np.zeros_like(freqs_hz)
         asd_amp_electronic_2 = np.zeros_like(freqs_hz)
         asd_amp_amplifier = np.zeros_like(freqs_hz)
+        asd_l2_johnson = np.zeros_like(freqs_hz)
+        asd_l2_johnson_2 = np.zeros_like(freqs_hz)
+        asd_l2_phonon = np.zeros_like(freqs_hz)
+        asd_l2_phonon_2 = np.zeros_like(freqs_hz)
+        asd_l2_tls = np.zeros_like(freqs_hz)
+        asd_l2_electronic = np.zeros_like(freqs_hz)
+        asd_l2_electronic_2 = np.zeros_like(freqs_hz)
+        asd_l2_amplifier = np.zeros_like(freqs_hz)
         phase_resp = np.zeros_like(freqs_hz)
         amp_resp = np.zeros_like(freqs_hz)
+        l2_resp = np.zeros_like(freqs_hz)
+        l2_scale = float(s.dL2_dT_H_per_K)
 
         for i, f_hz in enumerate(freqs_hz):
             y_j_a1 = s._propagate_noise_vector(s.n_johnson_A_1(), f_hz)
@@ -916,23 +979,30 @@ class NoiseGui:
             asd_amp_electronic[i] = np.sqrt(abs(y_e_a1[0]) ** 2 + abs(y_e_phi1[0]) ** 2 + abs(y_e_a_2[0]) ** 2 + abs(y_e_phi_2[0]) ** 2)
             asd_amp_electronic_2[i] = np.sqrt(abs(y_e_a_2[0]) ** 2 + abs(y_e_phi_2[0]) ** 2)
             asd_amp_amplifier[i] = np.sqrt(abs(y_amp_a[0]) ** 2 + abs(y_amp_phi[0]) ** 2)
+            asd_l2_johnson[i] = abs(l2_scale) * np.sqrt(abs(y_j_a1[3]) ** 2 + abs(y_j_phi1[3]) ** 2 + abs(y_j_a_2[3]) ** 2 + abs(y_j_phi_2[3]) ** 2)
+            asd_l2_johnson_2[i] = abs(l2_scale) * np.sqrt(abs(y_j_a_2[3]) ** 2 + abs(y_j_phi_2[3]) ** 2)
+            asd_l2_phonon[i] = abs(l2_scale) * np.sqrt(abs(y_ph1[3]) ** 2 + abs(y_ph_2[3]) ** 2)
+            asd_l2_phonon_2[i] = abs(l2_scale) * abs(y_ph_2[3])
+            asd_l2_tls[i] = abs(l2_scale) * abs(y_tls[3])
+            asd_l2_electronic[i] = abs(l2_scale) * np.sqrt(abs(y_e_a1[3]) ** 2 + abs(y_e_phi1[3]) ** 2 + abs(y_e_a_2[3]) ** 2 + abs(y_e_phi_2[3]) ** 2)
+            asd_l2_electronic_2[i] = abs(l2_scale) * np.sqrt(abs(y_e_a_2[3]) ** 2 + abs(y_e_phi_2[3]) ** 2)
+            asd_l2_amplifier[i] = abs(l2_scale) * np.sqrt(abs(y_amp_a[3]) ** 2 + abs(y_amp_phi[3]) ** 2)
             phase_resp[i] = s.phase_responsivity_mag_rad_per_W_at_hz(float(f_hz))
-            y_unit_power = np.linalg.solve(
-                s.m_matrix_array(float(f_hz)),
-                np.array(
-                    (
-                        0.0 + 0.0j,
-                        0.0 + 0.0j,
-                        s.event_power_fraction_kid1_clamped + 0.0j,
-                        s.event_power_fraction_kid2 + 0.0j,
-                    ),
-                    dtype=complex,
+            y_unit_power = s._solve_response_vector(
+                (
+                    0.0 + 0.0j,
+                    0.0 + 0.0j,
+                    s.event_power_fraction_kid1_clamped + 0.0j,
+                    s.event_power_fraction_kid2 + 0.0j,
                 ),
+                float(f_hz),
             )
             amp_resp[i] = abs(y_unit_power[0])
+            l2_resp[i] = abs(l2_scale * y_unit_power[3])
 
         asd_phase_total = np.sqrt(asd_phase_johnson**2 + asd_phase_phonon**2 + asd_phase_tls**2 + asd_phase_electronic**2 + asd_phase_amplifier**2)
         asd_amp_total = np.sqrt(asd_amp_johnson**2 + asd_amp_phonon**2 + asd_amp_tls**2 + asd_amp_electronic**2 + asd_amp_amplifier**2)
+        asd_l2_total = np.sqrt(asd_l2_johnson**2 + asd_l2_phonon**2 + asd_l2_tls**2 + asd_l2_electronic**2 + asd_l2_amplifier**2)
         asd_tls_direct = np.array([s.tls_phi_asd_at_hz_per_rtHz(float(f)) for f in freqs_hz], dtype=float)
         asd_johnson_simple = abs(s.f0_Hz * s.dphi_df_detuning_per_hz) * np.sqrt(s.sf_over_f0sq_johnson_simple)
         nep_phase_johnson = np.where(phase_resp > 0.0, asd_phase_johnson / phase_resp, np.nan)
@@ -953,9 +1023,19 @@ class NoiseGui:
         nep_amp_electronic_2 = np.where(amp_resp > 0.0, asd_amp_electronic_2 / amp_resp, np.nan)
         nep_amp_amplifier = np.where(amp_resp > 0.0, asd_amp_amplifier / amp_resp, np.nan)
         nep_amp_total = np.where(amp_resp > 0.0, asd_amp_total / amp_resp, np.nan)
+        nep_l2_johnson = np.where(l2_resp > 0.0, asd_l2_johnson / l2_resp, np.nan)
+        nep_l2_johnson_2 = np.where(l2_resp > 0.0, asd_l2_johnson_2 / l2_resp, np.nan)
+        nep_l2_phonon = np.where(l2_resp > 0.0, asd_l2_phonon / l2_resp, np.nan)
+        nep_l2_phonon_2 = np.where(l2_resp > 0.0, asd_l2_phonon_2 / l2_resp, np.nan)
+        nep_l2_tls = np.where(l2_resp > 0.0, asd_l2_tls / l2_resp, np.nan)
+        nep_l2_electronic = np.where(l2_resp > 0.0, asd_l2_electronic / l2_resp, np.nan)
+        nep_l2_electronic_2 = np.where(l2_resp > 0.0, asd_l2_electronic_2 / l2_resp, np.nan)
+        nep_l2_amplifier = np.where(l2_resp > 0.0, asd_l2_amplifier / l2_resp, np.nan)
+        nep_l2_total = np.where(l2_resp > 0.0, asd_l2_total / l2_resp, np.nan)
 
         sigma_e_phase_mev = _safe_sigma_energy_mev(s, freqs_hz, nep_phase_total)
         sigma_e_amp_mev = _safe_sigma_energy_mev(s, freqs_hz, nep_amp_total)
+        sigma_e_l2_mev = _safe_sigma_energy_mev(s, freqs_hz, nep_l2_total)
 
         marker_specs = [
             (float(s.count_rate_Hz), "f_rate", ":"),
@@ -972,8 +1052,10 @@ class NoiseGui:
             [asd_phase_johnson, asd_phase_phonon, asd_phase_tls, asd_phase_electronic, asd_phase_amplifier, asd_phase_total, asd_tls_direct, np.array([asd_johnson_simple])]
         )
         asd_amp_ylim = _positive_limits([asd_amp_johnson, asd_amp_phonon, asd_amp_tls, asd_amp_electronic, asd_amp_amplifier, asd_amp_total])
+        asd_l2_ylim = _positive_limits([asd_l2_johnson, asd_l2_phonon, asd_l2_tls, asd_l2_electronic, asd_l2_amplifier, asd_l2_total])
         nep_phase_ylim = _positive_limits([nep_phase_johnson, nep_phase_phonon, nep_phase_tls, nep_phase_electronic, nep_phase_amplifier, nep_phase_total])
         nep_amp_ylim = _positive_limits([nep_amp_johnson, nep_amp_phonon, nep_amp_tls, nep_amp_electronic, nep_amp_amplifier, nep_amp_total])
+        nep_l2_ylim = _positive_limits([nep_l2_johnson, nep_l2_phonon, nep_l2_tls, nep_l2_electronic, nep_l2_amplifier, nep_l2_total])
 
         return {
             "sensor": s,
@@ -982,21 +1064,29 @@ class NoiseGui:
             "asd_phase_2": (asd_phase_johnson_2, asd_phase_phonon_2, asd_phase_electronic_2),
             "asd_amp": (asd_amp_johnson, asd_amp_phonon, asd_amp_tls, asd_amp_electronic, asd_amp_amplifier, asd_amp_total),
             "asd_amp_2": (asd_amp_johnson_2, asd_amp_phonon_2, asd_amp_electronic_2),
+            "asd_l2": (asd_l2_johnson, asd_l2_phonon, asd_l2_tls, asd_l2_electronic, asd_l2_amplifier, asd_l2_total),
+            "asd_l2_2": (asd_l2_johnson_2, asd_l2_phonon_2, asd_l2_electronic_2),
             "asd_tls_direct": asd_tls_direct,
             "nep_phase": (nep_phase_johnson, nep_phase_phonon, nep_phase_tls, nep_phase_electronic, nep_phase_amplifier, nep_phase_total),
             "nep_phase_2": (nep_phase_johnson_2, nep_phase_phonon_2, nep_phase_electronic_2),
             "nep_amp": (nep_amp_johnson, nep_amp_phonon, nep_amp_tls, nep_amp_electronic, nep_amp_amplifier, nep_amp_total),
             "nep_amp_2": (nep_amp_johnson_2, nep_amp_phonon_2, nep_amp_electronic_2),
+            "nep_l2": (nep_l2_johnson, nep_l2_phonon, nep_l2_tls, nep_l2_electronic, nep_l2_amplifier, nep_l2_total),
+            "nep_l2_2": (nep_l2_johnson_2, nep_l2_phonon_2, nep_l2_electronic_2),
             "res_threshold_phase": _resolution_threshold_markers(freqs_hz, nep_phase_total),
             "res_threshold_amp": _resolution_threshold_markers(freqs_hz, nep_amp_total),
+            "res_threshold_l2": _resolution_threshold_markers(freqs_hz, nep_l2_total),
             "asd_johnson_simple": asd_johnson_simple,
             "sigma_phase_mev": sigma_e_phase_mev,
             "sigma_amp_mev": sigma_e_amp_mev,
+            "sigma_l2_mev": sigma_e_l2_mev,
             "markers": valid_markers,
             "asd_phase_ylim": asd_phase_ylim,
             "asd_amp_ylim": asd_amp_ylim,
+            "asd_l2_ylim": asd_l2_ylim,
             "nep_phase_ylim": nep_phase_ylim,
             "nep_amp_ylim": nep_amp_ylim,
+            "nep_l2_ylim": nep_l2_ylim,
         }
 
     def _draw(self) -> None:
@@ -1005,10 +1095,22 @@ class NoiseGui:
         freqs = d["freqs"]
         readout = self.readout_var.get()
         is_phase = readout == "Phase"
-        asd_johnson, asd_phonon, asd_tls, asd_electronic, asd_amplifier, asd_total = d["asd_phase"] if is_phase else d["asd_amp"]
-        asd_johnson_2, asd_phonon_2, asd_electronic_2 = d["asd_phase_2"] if is_phase else d["asd_amp_2"]
-        nep_johnson, nep_phonon, nep_tls, nep_electronic, nep_amplifier, nep_total = d["nep_phase"] if is_phase else d["nep_amp"]
-        nep_johnson_2, nep_phonon_2, nep_electronic_2 = d["nep_phase_2"] if is_phase else d["nep_amp_2"]
+        if readout == "L2":
+            asd_key, asd_2_key, nep_key, nep_2_key = "asd_l2", "asd_l2_2", "nep_l2", "nep_l2_2"
+            asd_ylim_key, nep_ylim_key, threshold_key, sigma_key = "asd_l2_ylim", "nep_l2_ylim", "res_threshold_l2", "sigma_l2_mev"
+            asd_ylabel = "L2 ASD [H/rtHz]"
+        elif is_phase:
+            asd_key, asd_2_key, nep_key, nep_2_key = "asd_phase", "asd_phase_2", "nep_phase", "nep_phase_2"
+            asd_ylim_key, nep_ylim_key, threshold_key, sigma_key = "asd_phase_ylim", "nep_phase_ylim", "res_threshold_phase", "sigma_phase_mev"
+            asd_ylabel = "Phase ASD [rad/rtHz]"
+        else:
+            asd_key, asd_2_key, nep_key, nep_2_key = "asd_amp", "asd_amp_2", "nep_amp", "nep_amp_2"
+            asd_ylim_key, nep_ylim_key, threshold_key, sigma_key = "asd_amp_ylim", "nep_amp_ylim", "res_threshold_amp", "sigma_amp_mev"
+            asd_ylabel = "Amplitude ASD [1/rtHz]"
+        asd_johnson, asd_phonon, asd_tls, asd_electronic, asd_amplifier, asd_total = d[asd_key]
+        asd_johnson_2, asd_phonon_2, asd_electronic_2 = d[asd_2_key]
+        nep_johnson, nep_phonon, nep_tls, nep_electronic, nep_amplifier, nep_total = d[nep_key]
+        nep_johnson_2, nep_phonon_2, nep_electronic_2 = d[nep_2_key]
 
         self.ax.clear()
         mode = self.mode_var.get()
@@ -1024,7 +1126,7 @@ class NoiseGui:
             branch2 = (nep_johnson_2, nep_phonon_2, nep_electronic_2)
             ylab = "NEP [W/rtHz]"
             title = f"Noise-Equivalent Power vs Frequency ({readout} readout)"
-            self.ax.set_ylim(*(d["nep_phase_ylim"] if is_phase else d["nep_amp_ylim"]))
+            self.ax.set_ylim(*d[nep_ylim_key])
         else:
             ysets = (asd_johnson, asd_phonon, asd_tls, asd_electronic, asd_amplifier, asd_total)
             branch1 = (
@@ -1034,9 +1136,9 @@ class NoiseGui:
                 np.sqrt(np.maximum(asd_electronic**2 - asd_electronic_2**2, 0.0)),
             )
             branch2 = (asd_johnson_2, asd_phonon_2, asd_electronic_2)
-            ylab = "Phase ASD [rad/rtHz]" if is_phase else "Amplitude ASD [1/rtHz]"
+            ylab = asd_ylabel
             title = f"Noise ASD vs Frequency ({readout} readout)"
-            self.ax.set_ylim(*(d["asd_phase_ylim"] if is_phase else d["asd_amp_ylim"]))
+            self.ax.set_ylim(*d[asd_ylim_key])
 
         if dual:
             self.ax.loglog(freqs, branch1[0], label="Johnson (KID1)", color="tab:blue")
@@ -1101,7 +1203,7 @@ class NoiseGui:
             self.ax.text(f_mark_hz, y_text, name, rotation=90, va="top", ha="right", transform=self.ax.get_xaxis_transform())
             prev_log10_f = log10_f
 
-        threshold_marks = d["res_threshold_phase"] if is_phase else d["res_threshold_amp"]
+        threshold_marks = d[threshold_key]
         for f_thr_hz, label in threshold_marks:
             idx = int(np.argmin(np.abs(freqs - f_thr_hz)))
             y_thr = float(ysets[5][idx])
@@ -1110,7 +1212,7 @@ class NoiseGui:
                 self.ax.text(f_thr_hz, y_thr * 1.18, label, ha="center", va="bottom", color="k")
 
         if s.mt_stable:
-            sigma_mev = d["sigma_phase_mev"] if is_phase else d["sigma_amp_mev"]
+            sigma_mev = d[sigma_key]
             if np.isfinite(sigma_mev):
                 label = f"Estimated energy resolution: sigma_E = {sigma_mev:.3f} meV"
                 color = "black"
@@ -1160,6 +1262,7 @@ class NoiseGui:
         self._update_rule_indicators(sensor)
         self._draw()
         self._sync_event_windows(sensor)
+        self._sync_pulse_sweep_windows(sensor)
         if self.kid2_mode_var.get() == "Dual KID":
             no_kid2_noise = (
                 abs(sensor.nj2_scale) == 0.0
@@ -1194,6 +1297,9 @@ class NoiseGui:
 
     def _on_mode(self) -> None:
         self._draw()
+        for win in self.pulse_sweep_windows:
+            if not win.is_closed:
+                win.update_readout(self.readout_var.get())
 
     def _apply_from_fields(self) -> None:
         try:
@@ -1250,7 +1356,7 @@ class NoiseGui:
             self.last_loaded = dict(self.current)
             self.last_loaded_name = save_path.name
             self.last_loaded_ui_state = self._current_ui_state()
-            self._persist_startup_state(save_path)
+            self._persist_startup_state(save_path, self.current, self.last_loaded_ui_state)
             self._update_loaded_name()
             self._set_status(f"Saved settings to {save_path.name}")
         except Exception as exc:
@@ -1278,9 +1384,9 @@ class NoiseGui:
             self.last_loaded = dict(vals)
             self.last_loaded_name = load_path.name
             self.last_loaded_ui_state = self._extract_ui_state(loaded)
-            self._persist_startup_state(load_path)
             self._write_fields(self.current)
             self._apply_ui_state(self.last_loaded_ui_state)
+            self._persist_startup_state(load_path, self.current, self.last_loaded_ui_state)
             self._recompute_and_draw()
             self._push_undo(prev)
             self._update_loaded_name()
@@ -1342,6 +1448,26 @@ class NoiseGui:
 
     def _on_event_window_close(self, win: "EventResponseWindow") -> None:
         self.event_windows = [w for w in self.event_windows if (w is not win and not w.is_closed)]
+
+    def _open_pulse_sweeps(self) -> None:
+        try:
+            self.current = self._read_fields()
+            sensor = self._build_sensor(self.current)
+            win = PulseSweepWindow(self.root, sensor, self.readout_var.get(), on_close=self._on_pulse_sweep_window_close)
+            self.pulse_sweep_windows.append(win)
+        except Exception as exc:
+            self._set_status(f"Pulse sweeps failed: {exc}")
+
+    def _sync_pulse_sweep_windows(self, sensor: Sensor) -> None:
+        alive: list["PulseSweepWindow"] = []
+        for win in self.pulse_sweep_windows:
+            if not win.is_closed:
+                win.update_sensor(sensor, self.readout_var.get())
+                alive.append(win)
+        self.pulse_sweep_windows = alive
+
+    def _on_pulse_sweep_window_close(self, win: "PulseSweepWindow") -> None:
+        self.pulse_sweep_windows = [w for w in self.pulse_sweep_windows if w is not win and not w.is_closed]
 
     def run(self) -> None:
         startup = self.last_loaded_name if self.last_loaded_name else "defaults"
@@ -1462,23 +1588,7 @@ class EventResponseWindow:
     def _recompute_and_draw(self) -> None:
         s = self.sensor
         mt = np.array(s.mt_matrix, dtype=complex)
-        d1 = np.array(s.d1_matrix, dtype=complex)
-        if mt.shape[0] == 3:
-            src = np.array((0.0 + 0.0j, 0.0 + 0.0j, s.event_power_fraction_kid1_clamped + 0.0j), dtype=complex)
-        else:
-            src = np.array(
-                (
-                    0.0 + 0.0j,
-                    0.0 + 0.0j,
-                    s.event_power_fraction_kid1_clamped + 0.0j,
-                    s.event_power_fraction_kid2 + 0.0j,
-                ),
-                dtype=complex,
-            )
-        b = np.linalg.solve(d1, src)
-
         evals, evecs = np.linalg.eig(mt)
-        vinv = np.linalg.inv(evecs)
         neg = np.real(evals) < 0.0
         t_const = -1.0 / np.real(evals[neg]) if np.any(neg) else np.array([1.0])
         tau_min = float(np.min(t_const))
@@ -1499,10 +1609,7 @@ class EventResponseWindow:
             "clipped": n_samples < n_needed,
         }
 
-        coeff = vinv @ b
-        exp_terms = np.exp(np.outer(evals, self.t_s))
-        h = evecs @ (coeff[:, None] * exp_terms)
-        self.y_t = h * s.ho_decay_energy_J
+        self.y_t = s.event_response_time_per_eV(self.t_s) * s.ho_decay_energy_eV
 
         dt = float(self.t_s[1] - self.t_s[0])
         f_all = np.fft.fftfreq(self.t_s.size, d=dt)
@@ -1513,16 +1620,15 @@ class EventResponseWindow:
         self.y_fft = y_fft_all[:, pos]
 
         # Matrix frequency response for unit power input.
-        h_f = np.zeros((self.y_t.shape[0], freqs.size), dtype=complex)
+        h_f = np.zeros((4, freqs.size), dtype=complex)
+        src = (
+            0.0 + 0.0j,
+            0.0 + 0.0j,
+            s.event_power_fraction_kid1_clamped + 0.0j,
+            s.event_power_fraction_kid2 + 0.0j,
+        )
         for i, f_hz in enumerate(freqs):
-            m = s.m_matrix_array(float(f_hz))
-            if self.y_t.shape[0] == 3:
-                m = m[:3, :3]
-                rhs = np.array((src[0], src[1], src[2]), dtype=complex)
-            else:
-                rhs = src
-            y = np.linalg.solve(m, rhs)
-            h_f[:, i] = y
+            h_f[:, i] = s._solve_response_vector(src, float(f_hz))
         self.h_f_matrix = h_f * s.ho_decay_energy_J
         self._draw()
 
@@ -1642,6 +1748,203 @@ class EventResponseWindow:
                 self.status.set(f"Median |FFT-matrix|/matrix: {err:.3e}")
         else:
             self.status.set("")
+
+
+class PulseSweepWindow:
+    def __init__(self, parent: tk.Tk, sensor: Sensor, readout: str, on_close=None) -> None:
+        self.sensor = sensor
+        self.readout = readout
+        self.on_close = on_close
+        self.dataset: dict[str, object] | None = None
+        self.is_closed = False
+        self.win = tk.Toplevel(parent)
+        self.win.title("Pile-Up Pulse Sweep Generator")
+        self.win.geometry("1120x700")
+        self.win.protocol("WM_DELETE_WINDOW", self._handle_close)
+        self.fields = {
+            "n_single": tk.StringVar(value="100"),
+            "n_double": tk.StringVar(value="100"),
+            "n_noise": tk.StringVar(value="200"),
+            "n_energies": tk.StringVar(value="6"),
+            "minimum_smaller_energy_eV": tk.StringVar(value="1"),
+            "maximum_smaller_energy_eV": tk.StringVar(value="100"),
+            "lag_start_us": tk.StringVar(value="0.01"),
+            "lag_stop_us": tk.StringVar(value="2"),
+            "sample_time_s": tk.StringVar(value=""),
+            "record_duration_s": tk.StringVar(value=""),
+            "random_seed": tk.StringVar(value=""),
+        }
+        self._last_recommended_grid: tuple[float, float] | None = None
+        self._set_recommended_grid()
+        self.status = tk.StringVar(value="Generate sweeps to preview the pulse and noise ASD.")
+        self._build()
+
+    def _build(self) -> None:
+        self.win.columnconfigure(0, weight=1)
+        self.win.rowconfigure(0, weight=1)
+        plot_frame = ttk.Frame(self.win, padding=8)
+        plot_frame.grid(row=0, column=0, sticky="nsew")
+        self.fig = Figure(figsize=(8.5, 6.2), dpi=100)
+        self.ax_pulse = self.fig.add_subplot(211)
+        self.ax_noise = self.fig.add_subplot(212)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        NavigationToolbar2Tk(self.canvas, plot_frame).update()
+        controls = ttk.Frame(self.win, padding=8)
+        controls.grid(row=0, column=1, sticky="ns")
+        self.header = ttk.Label(controls, text=f"{self.readout} Pulse Sweeps", font=("Segoe UI", 11, "bold"))
+        self.header.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        specs = [
+            ("Single sweeps", "n_single"), ("Double sweeps", "n_double"), ("Noise sweeps", "n_noise"),
+            ("Double split levels", "n_energies"), ("Min smaller pulse [eV]", "minimum_smaller_energy_eV"),
+            ("Max smaller pulse [eV]", "maximum_smaller_energy_eV"), ("Lag start [us]", "lag_start_us"),
+            ("Lag stop [us]", "lag_stop_us"), ("Sample time [s]", "sample_time_s"),
+            ("Record duration [s]", "record_duration_s"),
+            ("Random seed", "random_seed"),
+        ]
+        group = ttk.LabelFrame(controls, text="Generation", padding=5)
+        group.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        for row, (label, key) in enumerate(specs):
+            ttk.Label(group, text=label, width=21).grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Entry(group, textvariable=self.fields[key], width=13).grid(row=row, column=1, pady=2)
+        ttk.Button(controls, text="Generate / Preview", command=self._generate).grid(row=2, column=0, columnspan=2, sticky="ew", pady=2)
+        ttk.Button(controls, text="Reset Grid From Modes", command=self._set_recommended_grid).grid(
+            row=3, column=0, columnspan=2, sticky="ew", pady=2
+        )
+        self.save_button = ttk.Button(controls, text="Save Dataset", command=self._save, state=tk.DISABLED)
+        self.save_button.grid(row=4, column=0, columnspan=2, sticky="ew", pady=2)
+        ttk.Label(controls, textvariable=self.status, wraplength=270, foreground="#333").grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+    def _set_recommended_grid(self) -> None:
+        try:
+            sample_time_s, record_duration_s = recommended_time_grid(
+                self.sensor,
+                lag_stop_us=float(self.fields["lag_stop_us"].get()),
+            )
+            self._last_recommended_grid = (sample_time_s, record_duration_s)
+            self.fields["sample_time_s"].set(f"{sample_time_s:.8g}")
+            self.fields["record_duration_s"].set(f"{record_duration_s:.8g}")
+            if hasattr(self, "status"):
+                self.status.set("Time grid reset from current model eigenmodes and lag range.")
+        except Exception as exc:
+            if hasattr(self, "status"):
+                self.status.set(f"Grid default failed: {exc}")
+
+    def _using_recommended_grid(self) -> bool:
+        if self._last_recommended_grid is None:
+            return False
+        try:
+            return bool(
+                np.isclose(float(self.fields["sample_time_s"].get()), self._last_recommended_grid[0], rtol=1.0e-7, atol=0.0)
+                and np.isclose(float(self.fields["record_duration_s"].get()), self._last_recommended_grid[1], rtol=1.0e-7, atol=0.0)
+            )
+        except ValueError:
+            return False
+
+    def _arguments(self) -> dict[str, int | float | None]:
+        seed = self.fields["random_seed"].get().strip()
+        return {
+            "n_single": int(self.fields["n_single"].get()), "n_double": int(self.fields["n_double"].get()),
+            "n_noise": int(self.fields["n_noise"].get()), "n_energies": int(self.fields["n_energies"].get()),
+            "minimum_smaller_energy_eV": float(self.fields["minimum_smaller_energy_eV"].get()),
+            "maximum_smaller_energy_eV": float(self.fields["maximum_smaller_energy_eV"].get()),
+            "lag_start_us": float(self.fields["lag_start_us"].get()), "lag_stop_us": float(self.fields["lag_stop_us"].get()),
+            "sample_time_s": float(self.fields["sample_time_s"].get()),
+            "record_duration_s": float(self.fields["record_duration_s"].get()),
+            "random_seed": None if not seed else int(seed),
+        }
+
+    def _generate(self) -> None:
+        try:
+            self.status.set("Generating sweeps and computing the noise ASD...")
+            self.win.update_idletasks()
+            def report_progress(message: str) -> None:
+                self.status.set(message)
+                self.win.update_idletasks()
+
+            self.dataset = generate_pulse_sweep_dataset(
+                self.sensor, readout=self.readout, progress=report_progress, **self._arguments()
+            )
+            freq = np.asarray(self.dataset["frequencies_hz"], dtype=float)
+            time_s = np.asarray(self.dataset["time_s"], dtype=float)
+            trace = np.asarray(self.dataset["single"]["trace"], dtype=float)[0]
+            noise = self.dataset["noise"]
+            good = freq > 0.0
+            label = str(self.dataset["readout_label"])
+            unit = str(self.dataset["units"]["trace"])
+            self.ax_pulse.clear()
+            self.ax_pulse.plot(time_s * 1.0e3, trace)
+            self.ax_pulse.set_title(f"Typical Single Pulse ({label})")
+            self.ax_pulse.set_xlabel("Time [ms]")
+            self.ax_pulse.set_ylabel(f"{label} [{unit}]")
+            self.ax_pulse.grid(True, alpha=0.25)
+            self.ax_noise.clear()
+            self.ax_noise.loglog(freq[good], np.asarray(noise["model_asd_per_rtHz"])[good], label="Model ASD")
+            self.ax_noise.loglog(freq[good], np.asarray(noise["estimated_asd_per_rtHz"])[good], label="Noise sweep ASD")
+            self.ax_noise.set_xlabel("Frequency [Hz]")
+            self.ax_noise.set_ylabel(f"{label} ASD [{self.dataset['units']['asd']}]")
+            self.ax_noise.grid(True, which="both", alpha=0.25)
+            self.ax_noise.legend(loc="best")
+            self.fig.tight_layout()
+            self.canvas.draw_idle()
+            self.save_button.configure(state=tk.NORMAL)
+            generation = self.dataset["generation"]
+            warnings = []
+            if generation.get("template_truncated", False):
+                warnings.append("filter/template truncated")
+            if generation.get("timing_fit_to_record", False):
+                warnings.append("pulse timing centered to fit record")
+            warning = f" WARNING: {', '.join(warnings)}." if warnings else ""
+            self.status.set(
+                f"Preview ready: N={generation['n_samples']}, dt={generation['dt_s']:.3g} s, "
+                f"duration={generation['record_duration_s']:.3g} s, "
+                f"filter={generation.get('template_duration_s', generation['record_duration_s']):.3g} s."
+                f"{warning} Save stores noise, single-event, and pile-up records."
+            )
+        except Exception as exc:
+            self.dataset = None
+            self.save_button.configure(state=tk.DISABLED)
+            self.status.set(f"Generation failed: {exc}")
+
+    def _save(self) -> None:
+        if self.dataset is None:
+            return
+        path = filedialog.asksaveasfilename(parent=self.win, initialdir=SAVES_DIR, initialfile=f"pileup_{self.dataset['readout']}_sweeps.pkl", defaultextension=".pkl", filetypes=[("Pickle files", "*.pkl"), ("All files", "*.*")])
+        if path:
+            save_path = Path(path)
+            tmp_path = save_path.with_name(f".{save_path.name}.tmp")
+            with tmp_path.open("wb") as f:
+                pickle.dump(self.dataset, f, protocol=pickle.HIGHEST_PROTOCOL)
+            tmp_path.replace(save_path)
+            self.status.set(f"Saved {Path(path).name}. Run analyze_pileup_optimal_filter.py.")
+
+    def update_sensor(self, sensor: Sensor, readout: str) -> None:
+        if self.is_closed:
+            return
+        refresh_grid = self._using_recommended_grid()
+        self.sensor = sensor
+        self.readout = readout
+        self.header.configure(text=f"{readout} Pulse Sweeps")
+        if refresh_grid:
+            self._set_recommended_grid()
+        self.dataset = None
+        self.save_button.configure(state=tk.DISABLED)
+        self.status.set("Model settings changed. Generate a new preview before saving.")
+
+    def update_readout(self, readout: str) -> None:
+        if self.is_closed or readout == self.readout:
+            return
+        self.readout = readout
+        self.header.configure(text=f"{readout} Pulse Sweeps")
+        self.dataset = None
+        self.save_button.configure(state=tk.DISABLED)
+        self.status.set("Selected readout changed. Generate a new preview before saving.")
+
+    def _handle_close(self) -> None:
+        self.is_closed = True
+        if callable(self.on_close):
+            self.on_close(self)
+        self.win.destroy()
 
 
 if __name__ == "__main__":

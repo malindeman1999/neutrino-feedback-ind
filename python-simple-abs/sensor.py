@@ -31,6 +31,9 @@ THETA_D_HO_K = 165.0
 THETA_D_AU_K = 170.0
 HO163_HALF_LIFE_Y = 4570.0
 SECONDS_PER_YEAR = 365.25 * 24.0 * 3600.0
+# A derivative state faster than this is physically negligible for this model
+# and makes the time-domain state matrix numerically singular.
+FEEDBACK_DERIVATIVE_TIME_FLOOR_S = 1.0e-15
 
 
 @dataclass(frozen=True)
@@ -95,7 +98,8 @@ class SensorInputs:
     series_L2_H: float = 0.0
     series_R2_Ohm: float = 0.0
     feedback_heater_gain_W_per_rad: float = 0.0
-    feedback_heater_derivative_gain_W_s_per_rad: float = 0.0
+    feedback_heater_derivative_time_s: float = 0.0
+    feedback_heater_derivative_filter_factor: float = 10.0
     f_demod_Hz: float = 0.0
 
 
@@ -149,7 +153,8 @@ class Version1SensorInputs(SensorInputs):
     series_L2_H: float = 1.2202373590582704e-07
     series_R2_Ohm: float = 0.0030667909782826183
     feedback_heater_gain_W_per_rad: float = -1.0e-10
-    feedback_heater_derivative_gain_W_s_per_rad: float = -5.0e-16
+    feedback_heater_derivative_time_s: float = 5.0e-6
+    feedback_heater_derivative_filter_factor: float = 10.0
     f_demod_Hz: float = 0.0
 
 @dataclass(frozen=True)
@@ -966,11 +971,9 @@ class Sensor:
         b = self.n_johnson_phi_2()
         return tuple(ai + bi for ai, bi in zip(a, b))
 
-    def _propagate_noise_vector(self, n_vec: Tuple[complex, complex, complex, complex], f_hz: float) -> np.ndarray:
+    def _propagate_noise_vector(self, n_vec: Tuple[complex, ...], f_hz: float) -> np.ndarray:
         """Propagate one source vector through Y = M^{-1} N."""
-        m = self.m_matrix_array(f_hz)
-        n = np.array(n_vec, dtype=complex)
-        return np.linalg.solve(m, n)
+        return self._solve_response_vector(n_vec, f_hz)
 
     @cached_property
     def amplifier_sideband_voltage_asd_V_per_rtHz(self) -> float:
@@ -1019,14 +1022,15 @@ class Sensor:
     def _solve_readout_noise_vector(self, q_r: complex, q_phi: complex, f_hz: float) -> np.ndarray:
         """Measured output from additive readout noise with correlated heater feedback."""
         m = self.m_matrix_array(f_hz)
-        rhs = np.zeros(4, dtype=complex)
-        omega = 2.0 * pi * f_hz
-        heater_transfer_W_per_rad = (
-            self.feedback_heater_gain_W_per_rad
-            + (1.0j * omega * self.feedback_heater_derivative_gain_W_s_per_rad)
-        )
-        rhs[3] = heater_transfer_W_per_rad * q_phi
-        y = np.linalg.solve(m, rhs)
+        rhs = np.zeros(m.shape[0], dtype=complex)
+        gain = float(self.feedback_heater_gain_W_per_rad)
+        if self.feedback_heater_derivative_state_enabled:
+            factor = float(self.feedback_heater_derivative_filter_factor)
+            rhs[3] = gain * (1.0 + factor) * q_phi
+            rhs[4] = q_phi
+        else:
+            rhs[3] = gain * q_phi
+        y = self._state_to_output_vector(np.linalg.solve(m, rhs))
         y[0] += q_r
         y[1] += q_phi
         return y
@@ -1102,17 +1106,13 @@ class Sensor:
 
     def phase_responsivity_complex_rad_per_W_at_hz(self, f_hz: float) -> complex:
         """Complex phase responsivity to power source: (M^-1)_{phi,power}."""
-        m = self.m_matrix_array(f_hz)
-        e_power = np.array(
-            (
-                0.0 + 0.0j,
-                0.0 + 0.0j,
-                self.event_power_fraction_kid1_clamped + 0.0j,
-                self.event_power_fraction_kid2 + 0.0j,
-            ),
-            dtype=complex,
+        e_power = (
+            0.0 + 0.0j,
+            0.0 + 0.0j,
+            self.event_power_fraction_kid1_clamped + 0.0j,
+            self.event_power_fraction_kid2 + 0.0j,
         )
-        y_unit_power = np.linalg.solve(m, e_power)
+        y_unit_power = self._solve_response_vector(e_power, f_hz)
         return complex(y_unit_power[1])
 
     def phase_responsivity_mag_rad_per_W_at_hz(self, f_hz: float) -> float:
@@ -1567,10 +1567,8 @@ class Sensor:
         b = self.n_electronic_phi_2()
         return tuple(ai + bi for ai, bi in zip(a, b))
 
-    def m_matrix(
-        self, f_hz: float = 1.0
-    ) -> Tuple[Tuple[complex, complex, complex, complex], Tuple[complex, complex, complex, complex], Tuple[complex, complex, complex, complex], Tuple[complex, complex, complex, complex]]:
-        """Compute 4x4 complex dual-KID M(omega) for states [r, phi, T1, T2]."""
+    def m_matrix_open_loop(self, f_hz: float = 1.0) -> tuple[tuple[complex, ...], ...]:
+        """Compute the physical dual-KID M(omega) for states [r, phi, T1, T2]."""
         w0 = 2.0 * pi * self.f0_Hz
         omega = 2.0 * pi * f_hz
         q = self.Qr
@@ -1606,7 +1604,7 @@ class Sensor:
                 abs(self.alpha_A2),
                 abs(self.alpha_phi2),
                 abs(self.feedback_heater_gain_W_per_rad),
-                abs(self.feedback_heater_derivative_gain_W_s_per_rad),
+                abs(self.feedback_heater_derivative_time_s),
             )
         )
 
@@ -1617,11 +1615,7 @@ class Sensor:
 
         if second_active:
             m41 = -((1.0 + self.beta_A / 2.0) * p2)
-            m42 = (
-                +(q * x * (self.beta_A + 2.0) * p2)
-                - self.feedback_heater_gain_W_per_rad
-                - (1.0j * omega * self.feedback_heater_derivative_gain_W_s_per_rad)
-            )
+            m42 = +(q * x * (self.beta_A + 2.0) * p2)
             m43 = 0.0 + 0.0j
             m44 = (1.0j * omega * c2) + g2 - (p2 * self.alpha_A2 / t02)
         else:
@@ -1637,9 +1631,64 @@ class Sensor:
             (m41, m42, m43, m44),
         )
 
+    def m_matrix(self, f_hz: float = 1.0) -> tuple[tuple[complex, ...], ...]:
+        """Compute the closed-loop dynamic-state matrix M(omega)."""
+        return tuple(tuple(v for v in row) for row in self.m_matrix_array(f_hz))
+
+    @cached_property
+    def feedback_heater_derivative_state_enabled(self) -> bool:
+        """Whether heater feedback needs its filtered-derivative state."""
+        tau_d = float(self.feedback_heater_derivative_time_s)
+        if tau_d < 0.0:
+            raise ValueError("feedback_heater_derivative_time_s must be >= 0")
+        return bool(
+            self.second_kid_active
+            and self.feedback_heater_gain_W_per_rad != 0.0
+            and tau_d > FEEDBACK_DERIVATIVE_TIME_FLOOR_S
+        )
+
+    def state_output_matrix(self) -> np.ndarray:
+        """Map dynamic states to the measured output coordinates [r, phi, T1, T2]."""
+        n_state = 5 if self.feedback_heater_derivative_state_enabled else 4
+        out = np.zeros((4, n_state), dtype=complex)
+        out[:, :4] = np.eye(4, dtype=complex)
+        return out
+
+    def _state_source_vector(self, source: Tuple[complex, ...]) -> np.ndarray:
+        n_state = 5 if self.feedback_heater_derivative_state_enabled else 4
+        out = np.zeros(n_state, dtype=complex)
+        raw = np.asarray(source, dtype=complex)
+        out[: min(4, raw.size)] = raw[:4]
+        return out
+
+    def _state_to_output_vector(self, state: np.ndarray) -> np.ndarray:
+        return self.state_output_matrix() @ np.asarray(state, dtype=complex)
+
     def m_matrix_array(self, f_hz: float = 1.0) -> np.ndarray:
-        """M matrix as a 4x4 complex ndarray."""
-        return np.array(self.m_matrix(f_hz), dtype=complex)
+        """Closed-loop matrix, including a filtered heater differentiator state."""
+        base = np.array(self.m_matrix_open_loop(f_hz), dtype=complex)
+        gain = float(self.feedback_heater_gain_W_per_rad)
+        if not self.second_kid_active or gain == 0.0:
+            return base
+        if not self.feedback_heater_derivative_state_enabled:
+            base[3, 1] -= gain
+            return base
+        factor = float(self.feedback_heater_derivative_filter_factor)
+        if factor <= 0.0:
+            raise ValueError("feedback_heater_derivative_filter_factor must be > 0 when derivative feedback is enabled")
+        tau_d = float(self.feedback_heater_derivative_time_s)
+        omega = 2.0 * pi * f_hz
+        out = np.zeros((5, 5), dtype=complex)
+        out[:4, :4] = base
+        out[3, 1] -= gain * (1.0 + factor)
+        out[3, 4] += gain * factor
+        out[4, 1] = -1.0
+        out[4, 4] = 1.0 + (1.0j * omega * tau_d / factor)
+        return out
+
+    def _solve_response_vector(self, source: Tuple[complex, ...], f_hz: float) -> np.ndarray:
+        state = np.linalg.solve(self.m_matrix_array(f_hz), self._state_source_vector(source))
+        return self._state_to_output_vector(state)
 
     @cached_property
     def second_kid_active(self) -> bool:
@@ -1654,7 +1703,7 @@ class Sensor:
                 abs(self.alpha_A2),
                 abs(self.alpha_phi2),
                 abs(self.feedback_heater_gain_W_per_rad),
-                abs(self.feedback_heater_derivative_gain_W_s_per_rad),
+                abs(self.feedback_heater_derivative_time_s),
             )
         )
 
@@ -1686,6 +1735,29 @@ class Sensor:
     def mt_matrix(self) -> np.ndarray:
         """Time-domain dynamics matrix Mt = -D1^{-1} D0."""
         return -np.linalg.inv(self.d1_matrix) @ self.d0_matrix
+
+    def event_response_time_per_eV(self, t_s: np.ndarray) -> np.ndarray:
+        """Causal modal measured response [r, phi, T1, T2] per absorbed eV."""
+        if not self.second_kid_active:
+            source = np.array((0.0 + 0.0j, 0.0 + 0.0j, 1.0 + 0.0j), dtype=complex)
+            initial = np.linalg.solve(self.d1_matrix, source)
+            evals, evecs = np.linalg.eig(np.asarray(self.mt_matrix, dtype=complex))
+            coeff = np.linalg.inv(evecs) @ initial
+            states = evecs @ (coeff[:, None] * np.exp(np.outer(evals, np.asarray(t_s, dtype=float))))
+            out = np.zeros((4, states.shape[1]), dtype=complex)
+            out[:3] = states
+            return out * J_PER_EV
+        source = (
+            0.0 + 0.0j,
+            0.0 + 0.0j,
+            self.event_power_fraction_kid1_clamped + 0.0j,
+            self.event_power_fraction_kid2 + 0.0j,
+        )
+        initial = np.linalg.solve(self.d1_matrix, self._state_source_vector(source))
+        evals, evecs = np.linalg.eig(np.asarray(self.mt_matrix, dtype=complex))
+        coeff = np.linalg.inv(evecs) @ initial
+        states = evecs @ (coeff[:, None] * np.exp(np.outer(evals, np.asarray(t_s, dtype=float))))
+        return self.state_output_matrix() @ states * J_PER_EV
 
     @cached_property
     def mt_eigenvalues(self) -> np.ndarray:
@@ -1967,6 +2039,9 @@ class Sensor:
             "detuning_Hz": self.detuning_Hz,
             "x": self.x,
             "f_demod_Hz": self.f_demod_Hz,
+            "feedback_heater_gain_W_per_rad": self.feedback_heater_gain_W_per_rad,
+            "feedback_heater_derivative_time_s": self.feedback_heater_derivative_time_s,
+            "feedback_heater_derivative_filter_factor": self.feedback_heater_derivative_filter_factor,
             "heater2_offset_dBm": self.heater2_offset_dBm,
             "T02_K": self.T02_eff_K,
             "nep_sufficiency_percent": self.nep_sufficiency_percent,
@@ -2141,6 +2216,10 @@ class Sensor:
             "mt_eig2_imag_per_s": float(np.imag(self.mt_eigenvalues_sorted[1])),
             "mt_eig3_real_per_s": float(np.real(self.mt_eigenvalues_sorted[2])),
             "mt_eig3_imag_per_s": float(np.imag(self.mt_eigenvalues_sorted[2])),
+            "mt_eig4_real_per_s": float(np.real(self.mt_eigenvalues_sorted[3])) if self.mt_eigenvalues_sorted.size > 3 else float("nan"),
+            "mt_eig4_imag_per_s": float(np.imag(self.mt_eigenvalues_sorted[3])) if self.mt_eigenvalues_sorted.size > 3 else float("nan"),
+            "mt_eig5_real_per_s": float(np.real(self.mt_eigenvalues_sorted[4])) if self.mt_eigenvalues_sorted.size > 4 else float("nan"),
+            "mt_eig5_imag_per_s": float(np.imag(self.mt_eigenvalues_sorted[4])) if self.mt_eigenvalues_sorted.size > 4 else float("nan"),
             "mt_max_real_part_per_s": self.mt_max_real_part,
             "mt_stable": float(self.mt_stable),
             "mt_pulse_shortening_ratio": self.mt_pulse_shortening_ratio,

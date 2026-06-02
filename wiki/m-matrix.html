@@ -63,7 +63,7 @@
 
     <section class="card">
       <h2>Implementation Form</h2>
-      <p>In code, \(M(\omega)\) is built directly from project parameters and evaluated at demodulated frequency \(f\). The current implementation uses a dual-KID state \([r,\phi,T_1,T_2]\) with optional fallback to the original single-KID thermal subspace.</p>
+      <p>In code, \(M(\omega)\) is built directly from project parameters and evaluated at demodulated frequency \(f\). With derivative heater feedback enabled, the current implementation uses the dual-KID state \([r,\phi,T_1,T_2,z_d]\), where \(z_d\) is the filtered differentiator state; without derivative feedback it reduces to the physical thermal/electrical subspace.</p>
       <p>For this projectâ€™s nominal estimates, \(f=0\) Hz in the demodulated band is used by default.</p>
       <p>Python: <a href="../python-simple-abs/sensor.py"><code>Sensor.m_matrix()</code></a>, <a href="../python-simple-abs/sensor.py"><code>Sensor.m_matrix_array()</code></a>.</p>
     </section>
@@ -77,22 +77,26 @@
       \dfrac{2i\omega Q_i}{\omega_0}+\dfrac{Q_i}{Q}+\beta_A+4Q_iQx^2 &
       -\dfrac{4i\omega Q_iQx}{\omega_0} &
       -2Qx\beta_A+\dfrac{2\alpha_{A1}}{T_{01}} &
-      \dfrac{2\alpha_{A2}}{T_{02}}\\[1.0em]
+      \dfrac{2\alpha_{A2}}{T_{02}} & 0\\[1.0em]
       \dfrac{4i\omega Q_iQx}{\omega_0}-\beta_\phi &
       \dfrac{2i\omega Q_i}{\omega_0}+\dfrac{Q_i}{Q}+4Q_iQx^2+2Qx\beta_\phi &
       -\dfrac{2\alpha_{\phi1}}{T_{01}} &
-      -\dfrac{2\alpha_{\phi2}}{T_{02}}\\[1.0em]
+      -\dfrac{2\alpha_{\phi2}}{T_{02}} & 0\\[1.0em]
       -\left(1+\dfrac{\beta_A}{2}\right)P_1 &
       Qx(\beta_A+2)P_1 &
       i\omega C_1+G_1-\dfrac{P_1\alpha_{A1}}{T_{01}} &
-      0\\[1.0em]
+      0 & 0\\[1.0em]
       -\left(1+\dfrac{\beta_A}{2}\right)P_2 &
-      Qx(\beta_A+2)P_2-K_p-i\omega K_d &
+      Qx(\beta_A+2)P_2-K_p(1+N_d) &
       0 &
-      i\omega C_2+G_2-\dfrac{P_2\alpha_{A2}}{T_{02}}
+      i\omega C_2+G_2-\dfrac{P_2\alpha_{A2}}{T_{02}} &
+      K_pN_d\\[1.0em]
+      0 & -1 & 0 & 0 &
+      1+i\omega\dfrac{\tau_d}{N_d}
       \end{bmatrix}.
       \]</p>
-      <p>Here \(K_p\) is heater proportional gain (\(\mathrm{W/rad}\)) and \(K_d\) is heater derivative gain (\(\mathrm{W\cdot s/rad}\)).</p>
+      <p>Here \(K_p\) is heater proportional gain (\(\mathrm{W/rad}\)), \(\tau_d\) is the differentiator time, and \(N_d\) limits the high-frequency differentiator gain. The last row is the additional linear differential equation for \(z_d\).</p>
+      <p>Numerically, nonnegative \(\tau_d\le 10^{-15}\) s is treated as zero because its derivative contribution is negligible on modeled time scales while an explicit state at that scale makes the eigenvalue calculation singular. Negative \(\tau_d\) is invalid.</p>
       <p>Here \(P_1+P_2=P_0\), with \(P_j\) split by series loss (\(P_j\propto R_j\)).</p>
       <p>This is the exact matrix structure currently implemented in <a href="../python-simple-abs/sensor.py"><code>Sensor.m_matrix()</code></a>.</p>
       <p>Detailed branch-power split and its use in matrix/noise normalization: <a href="power-partitioning.html">Power Partitioning</a>.</p>

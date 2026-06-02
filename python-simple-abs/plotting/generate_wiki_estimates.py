@@ -129,6 +129,8 @@ def main() -> None:
         "series_R2_Ohm": "Ohm",
         "heater2_offset_dBm": "dBm",
         "feedback_heater_gain_W_per_rad": "W/rad",
+        "feedback_heater_derivative_time_s": "s",
+        "feedback_heater_derivative_filter_factor": "1",
         "absorber_volume_m3": "m^3",
         "membrane_length_m": "m",
         "membrane_width_m": "m",
@@ -237,6 +239,7 @@ def main() -> None:
         "mt_eig2_per_s": "1/s",
         "mt_eig3_per_s": "1/s",
         "mt_eig4_per_s": "1/s",
+        "mt_eig5_per_s": "1/s",
         "mt_max_real_part_per_s": "1/s",
         "mt_stable": "1",
         "mt_pulse_shortening_ratio": "1",
@@ -319,6 +322,8 @@ def main() -> None:
         "series_R2_Ohm": r"\(R_2\)",
         "heater2_offset_dBm": r"\(P_{\mathrm{heater2,off,dBm}}\)",
         "feedback_heater_gain_W_per_rad": r"\(K_{\mathrm{fb}}\)",
+        "feedback_heater_derivative_time_s": r"\(\tau_{d,\mathrm{fb}}\)",
+        "feedback_heater_derivative_filter_factor": r"\(N_{d,\mathrm{fb}}\)",
         "absorber_volume_m3": r"\(V_{\mathrm{abs}}\)",
         "membrane_length_m": r"\(L_{\mathrm{mem}}\)",
         "membrane_width_m": r"\(W_{\mathrm{mem}}\)",
@@ -427,6 +432,7 @@ def main() -> None:
         "mt_eig2_per_s": r"\(\lambda_2(M_t)\)",
         "mt_eig3_per_s": r"\(\lambda_3(M_t)\)",
         "mt_eig4_per_s": r"\(\lambda_4(M_t)\)",
+        "mt_eig5_per_s": r"\(\lambda_5(M_t)\)",
         "mt_max_real_part_per_s": r"\(\max\Re[\lambda(M_t)]\)",
         "mt_stable": r"\(\mathbb{1}_{\mathrm{stable}}\)",
         "mt_pulse_shortening_ratio": r"\(\rho_{\mathrm{short}}\)",
@@ -534,6 +540,7 @@ def main() -> None:
         "mt_eig2_per_s": r"\(\lambda_2(M_t)\)",
         "mt_eig3_per_s": r"\(\lambda_3(M_t)\)",
         "mt_eig4_per_s": r"\(\lambda_4(M_t)\)",
+        "mt_eig5_per_s": r"\(\lambda_5(M_t)\)",
         "mt_max_real_part_per_s": r"\(\max\Re[\lambda(M_t)]\)",
         "mt_stable": r"\(1\ \mathrm{if}\ \Re[\lambda_i(M_t)]<0\ \forall i\)",
         "mt_pulse_shortening_ratio": r"\(\rho_{\mathrm{short}}=\dfrac{G/C}{\min_i\left(-\Re[\lambda_i(M_t)]\right)}\ \mathrm{if\ stable}\)",
@@ -656,6 +663,7 @@ def main() -> None:
         "mt_eig2_per_s": set(),
         "mt_eig3_per_s": set(),
         "mt_eig4_per_s": set(),
+        "mt_eig5_per_s": set(),
         "mt_max_real_part_per_s": set(),
         "mt_stable": set(),
         "mt_pulse_shortening_ratio": {
@@ -664,6 +672,7 @@ def main() -> None:
             "mt_eig2_per_s",
             "mt_eig3_per_s",
             "mt_eig4_per_s",
+            "mt_eig5_per_s",
             "G_W_per_K",
             "C_J_per_K",
         },
@@ -890,6 +899,7 @@ def main() -> None:
     model_outputs["mt_eig2_per_s"] = _fmt_complex(complex(eigs[1]))
     model_outputs["mt_eig3_per_s"] = _fmt_complex(complex(eigs[2]))
     model_outputs["mt_eig4_per_s"] = _fmt_complex(complex(eigs[3])) if len(eigs) > 3 else "n/a"
+    model_outputs["mt_eig5_per_s"] = _fmt_complex(complex(eigs[4])) if len(eigs) > 4 else "n/a"
 
     # Validate formula dependencies against available model quantities.
     allowed = set(model_inputs.keys()) | set(model_outputs.keys())
@@ -985,6 +995,8 @@ def main() -> None:
             "series_L2_H",
             "series_R2_Ohm",
             "feedback_heater_gain_W_per_rad",
+            "feedback_heater_derivative_time_s",
+            "feedback_heater_derivative_filter_factor",
         ],
         "Material and Activity": [
             "ho_in_au_atomic_fraction",
@@ -1154,6 +1166,7 @@ def main() -> None:
             "mt_eig2_per_s",
             "mt_eig3_per_s",
             "mt_eig4_per_s",
+            "mt_eig5_per_s",
             "mt_max_real_part_per_s",
             "bifurcation_power_ratio",
             "mt_pulse_shortening_ratio",

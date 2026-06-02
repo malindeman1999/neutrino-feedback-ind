@@ -112,6 +112,8 @@
 <tr><td>series_L2_H</td><td>\(L_2\)</td><td><code>1.220237e-07</code></td><td>H</td></tr>
 <tr><td>series_R2_Ohm</td><td>\(R_2\)</td><td><code>0.00306679</code></td><td>Ohm</td></tr>
 <tr><td>feedback_heater_gain_W_per_rad</td><td>\(K_{\mathrm{fb}}\)</td><td><code>-1.000000e-10</code></td><td>W/rad</td></tr>
+<tr><td>feedback_heater_derivative_time_s</td><td>\(\tau_{d,\mathrm{fb}}\)</td><td><code>5.000000e-06</code></td><td>s</td></tr>
+<tr><td>feedback_heater_derivative_filter_factor</td><td>\(N_{d,\mathrm{fb}}\)</td><td><code>10</code></td><td>1</td></tr>
       </table>
     </section>
     
@@ -300,9 +302,10 @@
 <tr><td>kid2_inductance_headroom_over_event_ratio</td><td><a href="project.html#core-rule-checks">\(\Delta L_{2,\mathrm{head}}/\Delta L_{1,\mathrm{event}}\)</a></td><td>\(\Delta L_{2,\mathrm{head}}/\Delta L_{1,\mathrm{event}}\)</td><td><code>0.0695814</code></td><td>1</td></tr>
 <tr><td>p_bifurcation_W</td><td><a href="bifurcation-limit.html#bifurcation-model">\(P_{\mathrm{bif}}\)</a></td><td>\(P_{\mathrm{bif}}=\dfrac{Q_c\omega_0E_*}{2Q_r^3}\)</td><td><code>5.760000e-14</code></td><td>W</td></tr>
 <tr><td>mt_eig1_per_s</td><td><a href="mt-stability.html#stability-criterion">\(\lambda_1(M_t)\)</a></td><td>\(\lambda_1(M_t)\)</td><td><code>-2376.14 + 0i</code></td><td>1/s</td></tr>
-<tr><td>mt_eig2_per_s</td><td><a href="mt-stability.html#stability-criterion">\(\lambda_2(M_t)\)</a></td><td>\(\lambda_2(M_t)\)</td><td><code>-2.613671e+04 + 0i</code></td><td>1/s</td></tr>
-<tr><td>mt_eig3_per_s</td><td><a href="mt-stability.html#stability-criterion">\(\lambda_3(M_t)\)</a></td><td>\(\lambda_3(M_t)\)</td><td><code>-2.033552e+05 + 0i</code></td><td>1/s</td></tr>
-<tr><td>mt_eig4_per_s</td><td><a href="mt-stability.html#stability-criterion">\(\lambda_4(M_t)\)</a></td><td>\(\lambda_4(M_t)\)</td><td><code>-1.041030e+07 + 0i</code></td><td>1/s</td></tr>
+<tr><td>mt_eig2_per_s</td><td><a href="mt-stability.html#stability-criterion">\(\lambda_2(M_t)\)</a></td><td>\(\lambda_2(M_t)\)</td><td><code>-2.613672e+04 + 0i</code></td><td>1/s</td></tr>
+<tr><td>mt_eig3_per_s</td><td><a href="mt-stability.html#stability-criterion">\(\lambda_3(M_t)\)</a></td><td>\(\lambda_3(M_t)\)</td><td><code>-1.840475e+05 + 0i</code></td><td>1/s</td></tr>
+<tr><td>mt_eig4_per_s</td><td><a href="mt-stability.html#stability-criterion">\(\lambda_4(M_t)\)</a></td><td>\(\lambda_4(M_t)\)</td><td><code>-9.225255e+05 - 4.706775e+06i</code></td><td>1/s</td></tr>
+<tr><td>mt_eig5_per_s</td><td>\(\lambda_5(M_t)\)</td><td>\(\lambda_5(M_t)\)</td><td><code>-9.225255e+05 + 4.706775e+06i</code></td><td>1/s</td></tr>
 <tr><td>mt_max_real_part_per_s</td><td><a href="mt-stability.html#stability-criterion">\(\max\Re[\lambda(M_t)]\)</a></td><td>\(\max\Re[\lambda(M_t)]\)</td><td><code>-2376.14</code></td><td>1/s</td></tr>
 <tr><td>bifurcation_power_ratio</td><td><a href="bifurcation-limit.html#operating-margin">\(P_{0,x=0}/P_{\mathrm{bif}}\)</a></td><td>\(\dfrac{P_{0,x=0}}{P_{\mathrm{bif}}}\)</td><td><code>0.868056</code></td><td>1</td></tr>
 <tr><td>mt_pulse_shortening_ratio</td><td><a href="mt-stability.html#pulse-shortening">\(\rho_{\mathrm{short}}\)</a></td><td>\(\rho_{\mathrm{short}}=\dfrac{G/C}{\min_i\left(-\Re[\lambda_i(M_t)]\right)}\ \mathrm{if\ stable}\)</td><td><code>1.05238</code></td><td>1</td></tr>
